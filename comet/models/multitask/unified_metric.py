@@ -120,6 +120,9 @@ class UnifiedMetric(CometModel):
         error_labels: List[str] = ["minor", "major"],
         cross_entropy_weights: Optional[List[float]] = None,
         load_pretrained_weights: bool = True,
+        window_size: int = 1,  # New parameter for SLIDE
+        stride_size: int = 1,  # New parameter for SLIDE
+        include_partial_docs: bool = False,  # New flag for partial documents
     ) -> None:
         super().__init__(
             nr_frozen_epochs=nr_frozen_epochs,
@@ -140,6 +143,9 @@ class UnifiedMetric(CometModel):
             class_identifier="unified_metric",
             load_pretrained_weights=load_pretrained_weights,
         )
+        self.window_size = window_size
+        self.stride_size = stride_size
+        self.include_partial_docs = include_partial_docs
         self.save_hyperparameters()
         self.estimator = FeedForward(
             in_dim=self.encoder.output_units,
@@ -383,21 +389,38 @@ class UnifiedMetric(CometModel):
                 and targets.
         """
         inputs = {k: [d[k] for d in sample] for k in sample[0]}
-        input_sequences = [
-            self.encoder.prepare_sample(inputs["mt"], self.word_level, None),
-        ]
 
+        input_sequences = []
         src_input, ref_input = False, False
-        if ("src" in inputs) and ("src" in self.hparams.input_segments):
-            input_sequences.append(self.encoder.prepare_sample(inputs["src"]))
-            src_input = True
 
-        if ("ref" in inputs) and ("ref" in self.hparams.input_segments):
-            input_sequences.append(self.encoder.prepare_sample(inputs["ref"]))
-            ref_input = True
+        if self.window_size > 1:
+            doc_ids = inputs["doc_id"]
+            mt_windows = self.create_windows(inputs["mt"], doc_ids, self.window_size, self.stride_size, self.include_partial_docs)
+            input_sequences.append(self.encoder.prepare_sample(mt_windows, self.word_level, None))
+
+            if ("src" in inputs) and ("src" in self.hparams.input_segments):
+                src_windows = self.create_windows(inputs["src"], doc_ids, self.window_size, self.stride_size, self.include_partial_docs)
+                input_sequences.append(self.encoder.prepare_sample(src_windows))
+                src_input = True
+
+            if ("ref" in inputs) and ("ref" in self.hparams.input_segments):
+                ref_windows = self.create_windows(inputs["ref"], doc_ids, self.window_size, self.stride_size, self.include_partial_docs)
+                input_sequences.append(self.encoder.prepare_sample(ref_windows))
+                ref_input = True
+        else:
+            input_sequences.append(self.encoder.prepare_sample(inputs["mt"], self.word_level, None))
+
+            if ("src" in inputs) and ("src" in self.hparams.input_segments):
+                input_sequences.append(self.encoder.prepare_sample(inputs["src"]))
+                src_input = True
+
+            if ("ref" in inputs) and ("ref" in self.hparams.input_segments):
+                input_sequences.append(self.encoder.prepare_sample(inputs["ref"]))
+                ref_input = True
 
         unified_input = src_input and ref_input
         model_inputs = self.concat_inputs(input_sequences, unified_input)
+
         if stage == "predict":
             return model_inputs["inputs"]
 
@@ -408,14 +431,43 @@ class UnifiedMetric(CometModel):
             targets["system"] = inputs["system"]
 
         if self.word_level:
-            # Labels will be the same accross all inputs because we are only
-            # doing sequence tagging on the MT. We will only use the mask corresponding
-            # to the MT segment.
             seq_len = model_inputs["mt_length"].max()
             targets["mt_length"] = model_inputs["mt_length"]
             targets["labels"] = model_inputs["inputs"][0]["label_ids"][:, :seq_len]
 
         return model_inputs["inputs"], targets
+
+    
+    def create_windows(self, sentences: List[str], doc_ids: List[str], window_size: int, stride_size: int, include_partial_docs: bool) -> List[str]:
+        windows = []
+        current_doc = []
+        current_id = doc_ids[0]
+        
+        for i in range(len(sentences)):
+            if doc_ids[i] != current_id:
+                windows.extend(self._create_windows_for_doc(current_doc, window_size, stride_size, include_partial_docs))
+                current_doc = []
+                current_id = doc_ids[i]
+            current_doc.append(sentences[i])
+        if current_doc:
+            windows.extend(self._create_windows_for_doc(current_doc, window_size, stride_size, include_partial_docs))
+        return windows
+
+    def _create_windows_for_doc(self, sentences: List[str], window_size: int, stride_size: int, include_partial_docs: bool) -> List[str]:
+        windows = []
+        num_sentences = len(sentences)
+        
+        if window_size > num_sentences:
+            windows.append(" ".join(sentences))
+            return windows
+
+        for i in range(0, num_sentences, stride_size):
+            window = sentences[i:i + window_size]
+            if len(window) == window_size or (include_partial_docs and window):
+                windows.append(" ".join(window))
+        return windows
+
+
 
     def forward(
         self,

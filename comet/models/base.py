@@ -594,6 +594,14 @@ class CometModel(ptl.LightningModule, metaclass=abc.ABCMeta):
         else: # gpu = 0
             devices = "auto"
 
+        # define length_batching to False if self.window_size > 1
+        if self.window_size > 1:
+            length_batching = False
+            logger.warning(
+                "Length batching is disabled when using window_size > 1 (using SLIDE). "
+                "Setting length_batching to False."
+            )
+
         sampler = SequentialSampler(samples)
         if length_batching and gpus < 2:
             try:
